@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Multiplayer Netcode</title>
+  <style>
+    body {
+      margin: 0;
+      background: #1a1a2e;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      height: 100vh;
+    }
+    canvas {
+      border: 2px solid #444;
+    }
+    #info {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      color: #fff;
+      font-family: monospace;
+      font-size: 14px;
+    }
+  </style>
+</head>
+<body>
+  <div id="info">Connecting...</div>
+  <canvas id="arena" width="800" height="600"></canvas>
+  <script>
+    // Grab references to the canvas and info display
+    const canvas = document.getElementById('arena');
+    const ctx = canvas.getContext('2d');
+    const info = document.getElementById('info');
+
+    // Game constants (must match the server)
+    const PLAYER_SPEED = 200;
+    const PLAYER_SIZE = 30;
+    const ARENA_WIDTH = 800;
+    const ARENA_HEIGHT = 600;
+    const TICK_RATE = 20;
+    const TICK_INTERVAL = 1000 / TICK_RATE;
+
+    const WALLS = [
+        { x: 150, y: 150, width: 50, height: 300 }, // Left pillar
+        { x: 600, y: 150, width: 50, height: 300 }, // Right pillar
+        { x: 300, y: 280, width: 200, height: 40 }  // Center barrier
+    ];
+
+
+    // Lag simulator: pass ?lag=200 for 200ms round-trip
+    const params = new URLSearchParams(window.location.search);
+    const SIMULATED_LAG = parseInt(params.get('lag')) || 0;
+
+    // Client-side game state
+    let myId = null;
+    let players = {};
+    let pendingInputs = [];
+    let inputSeq = 0;
+    let keys = { w: false, a: false, s: false, d: false };
+    let bullets = [];
+
+
+        // Connect to the WebSocket server
+    const ws = new WebSocket(`ws://${window.location.host}`);
+
+    function sendWithLag(data) {
+        if (SIMULATED_LAG > 0) {
+            setTimeout(() => {
+            if (ws.readyState === WebSocket.OPEN) ws.send(data);
+            }, SIMULATED_LAG / 2);
+        } else {
+            ws.send(data);
+        }
+    }
+
+    function processMessage(data) {
+        const msg = JSON.parse(data);
+
+        if (msg.type === 'welcome') {
+            myId = msg.id;
+            msg.players.forEach(p => {
+            players[p.id] = { x: p.x, y: p.y, color: p.color };
+            });
+        info.textContent = `You are ${myId} | Simulated lag: ${SIMULATED_LAG}ms`;
+        }
+
+        if (msg.type === 'playerJoined') {
+            players[msg.id] = { x: msg.x, y: msg.y, color: msg.color };
+        }
+
+        if (msg.type === 'playerLeft') {
+            delete players[msg.id];
+        }
+
+        
+      if (msg.type === 'state') {
+        bullets = msg.bullets || []; // Save active bullets to draw
+
+        msg.players.forEach(serverPlayer => {
+          if (serverPlayer.id === myId) {
+            players[myId].x = serverPlayer.x;
+            players[myId].y = serverPlayer.y;
+            players[myId].health = serverPlayer.health;
+            players[myId].isDead = serverPlayer.isDead;
+
+            pendingInputs = pendingInputs.filter(
+              input => input.seq > serverPlayer.lastProcessedSeq
+            );
+
+            const dt = TICK_INTERVAL / 1000;
+            pendingInputs.forEach(input => {
+              applyInput(players[myId], input.keys, dt);
+            });
+          } else {
+            if (players[serverPlayer.id]) {
+              players[serverPlayer.id].x = serverPlayer.x;
+              players[serverPlayer.id].y = serverPlayer.y;
+              players[serverPlayer.id].angle = serverPlayer.angle;
+              players[serverPlayer.id].health = serverPlayer.health;
+              players[serverPlayer.id].isDead = serverPlayer.isDead;
+            }
+          }
+        });
+      }
+
+    }
+
+    ws.onopen = () => {
+        info.textContent = 'Connected. Waiting for game state...';
+    };
+
+    ws.onmessage = (event) => {
+        if (SIMULATED_LAG > 0) {
+            setTimeout(() => processMessage(event.data), SIMULATED_LAG / 2);
+        } else {
+        processMessage(event.data);
+        }
+    };
+
+    ws.onclose = () => {
+        info.textContent = 'Disconnected from server';
+    };
+
+
+        // Track which keys are currently pressed
+    document.addEventListener('keydown', (e) => {
+      const key = e.key.toLowerCase();
+      if (key in keys) keys[key] = true;
+    });
+
+    document.addEventListener('keyup', (e) => {
+      const key = e.key.toLowerCase();
+      if (key in keys) keys[key] = false;
+    });
+
+    let mouseAngle = 0;
+
+    document.addEventListener('mousemove', (e) => {
+      if (!myId || !players[myId]) return;
+      
+      // Get canvas bounds
+      const rect = canvas.getBoundingClientRect();
+      const mouseX = e.clientX - rect.left;
+      const mouseY = e.clientY - rect.top;
+
+      // Player center position
+      const playerCenterX = players[myId].x + PLAYER_SIZE / 2;
+      const playerCenterY = players[myId].y + PLAYER_SIZE / 2;
+
+      // Calculate angle in radians
+      mouseAngle = Math.atan2(mouseY - playerCenterY, mouseX - playerCenterX);
+    });
+
+
+    // Send inputs to the server at the tick rate
+     
+    let wantsToShoot = false;
+    document.addEventListener('mousedown', () => { wantsToShoot = true; });
+
+    setInterval(() => {
+      if (!myId || ws.readyState !== WebSocket.OPEN) return;
+      if (players[myId].isDead) return;
+
+      inputSeq++;
+      const input = { 
+        seq: inputSeq, 
+        keys: { ...keys }, 
+        angle: mouseAngle, 
+        shoot: wantsToShoot 
+      };
+
+      sendWithLag(JSON.stringify({ type: 'input', seq: inputSeq, ...input }));
+
+      // Client-side prediction
+      const dt = TICK_INTERVAL / 1000;
+      applyInput(players[myId], input.keys, dt);
+      players[myId].angle = mouseAngle; // Predict our aim angle locally
+
+      pendingInputs.push(input);
+      wantsToShoot = false; // Reset trigger
+    }, TICK_INTERVAL);
+
+
+
+    // Movement logic (identical to the server's applyInput)
+   // function applyInput(player, inputKeys, dt) {
+     // if (inputKeys.w) player.y -= PLAYER_SPEED * dt;
+      //if (inputKeys.s) player.y += PLAYER_SPEED * dt;
+ //     if (inputKeys.a) player.x -= PLAYER_SPEED * dt;
+   //   if (inputKeys.d) player.x += PLAYER_SPEED * dt;
+
+     // player.x = Math.max(0, Math.min(ARENA_WIDTH - PLAYER_SIZE, player.x));
+      //player.y = Math.max(0, Math.min(ARENA_HEIGHT - PLAYER_SIZE, player.y));
+    //}
+
+    function checkCollision(x, y, size) {
+  // Check arena bounds
+        if (x < 0 || x + size > ARENA_WIDTH || y < 0 || y + size > ARENA_HEIGHT) {
+            return true;
+        }
+  // Check map walls
+        for (const wall of WALLS) {
+            if (
+                x < wall.x + wall.width &&
+                x + size > wall.x &&
+                y < wall.y + wall.height &&
+                y + size > wall.y
+                ) {
+                return true;
+                }
+        }
+    return false;
+    }
+
+    function applyInput(player, inputKeys, dt) {
+        if (player.isDead) return;
+
+  // Move horizontally and check collision
+        let nextX = player.x;
+        if (inputKeys.a) nextX -= PLAYER_SPEED * dt;
+        if (inputKeys.d) nextX += PLAYER_SPEED * dt;
+  
+        if (!checkCollision(nextX, player.y, PLAYER_SIZE)) {
+            player.x = nextX;
+        }
+
+  // Move vertically and check collision
+        let nextY = player.y;
+        if (inputKeys.w) nextY -= PLAYER_SPEED * dt;
+        if (inputKeys.s) nextY += PLAYER_SPEED * dt;
+
+        if (!checkCollision(player.x, nextY, PLAYER_SIZE)) {
+            player.y = nextY;
+        }
+    }
+
+
+
+
+        // Draw the game arena every frame
+    
+    function render() {
+      // Background
+      ctx.fillStyle = '#16213e';
+      ctx.fillRect(0, 0, ARENA_WIDTH, ARENA_HEIGHT);
+
+      // Draw Walls
+      ctx.fillStyle = '#444';
+      WALLS.forEach(wall => {
+        ctx.fillRect(wall.x, wall.y, wall.width, wall.height);
+      });
+
+      // Draw Bullets
+      ctx.fillStyle = '#f1c40f'; // Yellow bullets
+      bullets.forEach(b => {
+        ctx.beginPath();
+        ctx.arc(b.x, b.y, 4, 0, Math.PI * 2);
+        ctx.fill();
+      });
+
+      // Draw Players
+      for (const id in players) {
+        const p = players[id];
+        if (p.isDead) continue; // Don't draw dead players
+
+        // Draw Player Body
+        ctx.fillStyle = p.color;
+        ctx.fillRect(p.x, p.y, PLAYER_SIZE, PLAYER_SIZE);
+
+        // Draw Gun (a line pointing in their aim direction)
+        const centerX = p.x + PLAYER_SIZE / 2;
+        const centerY = p.y + PLAYER_SIZE / 2;
+        ctx.strokeStyle = '#fff';
+        ctx.lineWidth = 4;
+        ctx.beginPath();
+        ctx.moveTo(centerX, centerY);
+        ctx.lineTo(
+          centerX + Math.cos(p.angle || 0) * 25,
+          centerY + Math.sin(p.angle || 0) * 25
+        );
+        ctx.stroke();
+
+        // Draw Health Bar
+        ctx.fillStyle = 'red';
+        ctx.fillRect(p.x, p.y - 15, PLAYER_SIZE, 4);
+        ctx.fillStyle = 'green';
+        ctx.fillRect(p.x, p.y - 15, PLAYER_SIZE * ((p.health || 0) / 100), 4);
+
+        // Name Tag
+        ctx.fillStyle = '#fff';
+        ctx.font = '10px monospace';
+        ctx.fillText(id === myId ? 'YOU' : id, p.x, p.y - 20);
+      }
+
+      // Display status info
+      ctx.fillStyle = '#fff';
+      ctx.font = '12px monospace';
+      ctx.fillText(`Pending inputs: ${pendingInputs.length}`, 10, ARENA_HEIGHT - 10);
+      if (SIMULATED_LAG > 0) {
+        ctx.fillStyle = '#f39c12';
+        ctx.fillText(`Simulated lag: ${SIMULATED_LAG}ms RTT`, 10, ARENA_HEIGHT - 28);
+      }
+
+      requestAnimationFrame(render);
+    }
+
+
+    render();
+
+  </script>
+</body>
+</html>
